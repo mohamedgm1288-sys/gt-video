@@ -4,8 +4,8 @@ import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:video_player/video_player.dart';
 
-const supabaseUrl = 'YOUR_SUPABASE_URL';
-const supabaseKey = 'YOUR_SUPABASE_ANON_KEY';
+const supabaseUrl = 'https://uinwmyybsutkwvhsrvvr.supabase.co';
+const supabaseKey = 'sb_publishable_PGRUpN4eaGb6NGlmMCIvKA_UJr77TP3';
 SupabaseClient get sb => Supabase.instance.client;
 const ac = Color(0xFF3DE0D0), bg = Color(0xFF1B1030), card = Color(0xFF2A1B47);
 
