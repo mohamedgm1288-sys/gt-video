@@ -1,0 +1,171 @@
+-- GT-video: شغّل الملف كله في Supabase > SQL Editor
+create table profiles(
+  id uuid primary key references auth.users on delete cascade,
+  username text unique not null,
+  bio text default '',
+  created_at timestamptz default now());
+
+create table videos(
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references profiles(id) on delete cascade,
+  url text not null,
+  caption text default '',
+  created_at timestamptz default now());
+
+create table likes(
+  user_id uuid references profiles(id) on delete cascade,
+  video_id uuid references videos(id) on delete cascade,
+  primary key(user_id, video_id));
+
+create table comments(
+  id uuid primary key default gen_random_uuid(),
+  video_id uuid not null references videos(id) on delete cascade,
+  user_id uuid not null references profiles(id) on delete cascade,
+  body text not null check (length(body) between 1 and 500),
+  created_at timestamptz default now());
+
+create table follows(
+  follower_id uuid references profiles(id) on delete cascade,
+  following_id uuid references profiles(id) on delete cascade,
+  primary key(follower_id, following_id),
+  check (follower_id <> following_id));
+
+create table messages(
+  id uuid primary key default gen_random_uuid(),
+  sender_id uuid not null references profiles(id) on delete cascade,
+  receiver_id uuid not null references profiles(id) on delete cascade,
+  body text not null check (length(body) between 1 and 2000),
+  created_at timestamptz default now());
+
+-- إنشاء الملف الشخصي تلقائيًا عند التسجيل
+create function handle_new_user() returns trigger language plpgsql security definer as $$
+begin
+  insert into profiles(id, username)
+  values (new.id, coalesce(nullif(new.raw_user_meta_data->>'username',''), split_part(new.email,'@',1)) || '_' || substr(new.id::text,1,4));
+  return new;
+end $$;
+create trigger on_auth_user_created after insert on auth.users
+  for each row execute function handle_new_user();
+
+-- الأمان (RLS)
+alter table profiles enable row level security;
+alter table videos enable row level security;
+alter table likes enable row level security;
+alter table comments enable row level security;
+alter table follows enable row level security;
+alter table messages enable row level security;
+
+create policy "قراءة الملفات" on profiles for select using (true);
+create policy "تعديل ملفي" on profiles for update using (auth.uid() = id);
+
+create policy "قراءة الفيديوهات" on videos for select using (true);
+create policy "نشر فيديو" on videos for insert with check (auth.uid() = user_id);
+create policy "حذف فيديو" on videos for delete using (auth.uid() = user_id);
+
+create policy "قراءة الإعجابات" on likes for select using (true);
+create policy "إعجاب" on likes for insert with check (auth.uid() = user_id);
+create policy "إلغاء إعجاب" on likes for delete using (auth.uid() = user_id);
+
+create policy "قراءة التعليقات" on comments for select using (true);
+create policy "تعليق" on comments for insert with check (auth.uid() = user_id);
+create policy "حذف تعليق" on comments for delete using (auth.uid() = user_id);
+
+create policy "قراءة المتابعات" on follows for select using (true);
+create policy "متابعة" on follows for insert with check (auth.uid() = follower_id);
+create policy "إلغاء متابعة" on follows for delete using (auth.uid() = follower_id);
+
+create policy "رسائلي" on messages for select using (auth.uid() in (sender_id, receiver_id));
+create policy "إرسال" on messages for insert with check (auth.uid() = sender_id);
+
+-- تخزين الفيديو
+insert into storage.buckets(id, name, public) values ('videos','videos',true);
+create policy "قراءة عامة" on storage.objects for select using (bucket_id='videos');
+create policy "رفع في مجلدي" on storage.objects for insert to authenticated
+  with check (bucket_id='videos' and (storage.foldername(name))[1] = auth.uid()::text);
+
+-- تفعيل الرسائل اللحظية
+alter publication supabase_realtime add table messages;
+
+-- ===== الإبلاغ والحظر =====
+create table reports(
+  id uuid primary key default gen_random_uuid(),
+  reporter_id uuid not null references profiles(id) on delete cascade,
+  video_id uuid references videos(id) on delete cascade,
+  reported_user_id uuid references profiles(id) on delete cascade,
+  reason text not null,
+  created_at timestamptz default now());
+alter table reports enable row level security;
+create policy "إبلاغ" on reports for insert with check (auth.uid() = reporter_id);
+-- المراجعة تتم من لوحة Supabase (Table Editor > reports) بحساب المالك
+
+create table blocks(
+  blocker_id uuid references profiles(id) on delete cascade,
+  blocked_id uuid references profiles(id) on delete cascade,
+  primary key(blocker_id, blocked_id),
+  check (blocker_id <> blocked_id));
+alter table blocks enable row level security;
+create policy "قراءة حظري" on blocks for select using (auth.uid() = blocker_id);
+create policy "حظر" on blocks for insert with check (auth.uid() = blocker_id);
+create policy "إلغاء حظر" on blocks for delete using (auth.uid() = blocker_id);
+
+-- منع الرسائل من/إلى المحظورين
+create policy "لا رسائل للمحظور" on messages as restrictive for insert
+  with check (not exists (select 1 from blocks b
+    where (b.blocker_id = receiver_id and b.blocked_id = sender_id)
+       or (b.blocker_id = sender_id and b.blocked_id = receiver_id)));
+
+-- ===== الإشعارات =====
+create table notifications(
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references profiles(id) on delete cascade,
+  actor_id uuid not null references profiles(id) on delete cascade,
+  type text not null,
+  video_id uuid references videos(id) on delete cascade,
+  read boolean default false,
+  created_at timestamptz default now());
+alter table notifications enable row level security;
+create policy "إشعاراتي" on notifications for select using (auth.uid() = user_id);
+create policy "تحديث إشعاراتي" on notifications for update using (auth.uid() = user_id);
+
+create function notify_like() returns trigger language plpgsql security definer as $$
+declare o uuid; begin
+  select user_id into o from videos where id = new.video_id;
+  if o <> new.user_id then
+    insert into notifications(user_id, actor_id, type, video_id) values (o, new.user_id, 'like', new.video_id);
+  end if; return new; end $$;
+create trigger t_like after insert on likes for each row execute function notify_like();
+
+create function notify_comment() returns trigger language plpgsql security definer as $$
+declare o uuid; begin
+  select user_id into o from videos where id = new.video_id;
+  if o <> new.user_id then
+    insert into notifications(user_id, actor_id, type, video_id) values (o, new.user_id, 'comment', new.video_id);
+  end if; return new; end $$;
+create trigger t_comment after insert on comments for each row execute function notify_comment();
+
+create function notify_follow() returns trigger language plpgsql security definer as $$
+begin
+  insert into notifications(user_id, actor_id, type) values (new.following_id, new.follower_id, 'follow');
+  return new; end $$;
+create trigger t_follow after insert on follows for each row execute function notify_follow();
+
+create function notify_message() returns trigger language plpgsql security definer as $$
+begin
+  insert into notifications(user_id, actor_id, type) values (new.receiver_id, new.sender_id, 'message');
+  return new; end $$;
+create trigger t_message after insert on messages for each row execute function notify_message();
+
+-- ===== الهاشتاجات الرائجة =====
+create function trending_hashtags() returns table(tag text, n bigint) language sql stable as $$
+  select lower(m[1]) as tag, count(*) as n
+  from videos, regexp_matches(caption, '#([^[:space:]#.,!?،؟]+)', 'g') as m
+  where created_at > now() - interval '7 days'
+  group by 1 order by 2 desc limit 10 $$;
+
+-- ===== حذف الحساب =====
+create function delete_my_account() returns void language plpgsql security definer as $$
+begin delete from auth.users where id = auth.uid(); end $$;
+revoke all on function delete_my_account() from public, anon;
+grant execute on function delete_my_account() to authenticated;
+create policy "حذف ملفاتي" on storage.objects for delete to authenticated
+  using (bucket_id='videos' and (storage.foldername(name))[1] = auth.uid()::text);
