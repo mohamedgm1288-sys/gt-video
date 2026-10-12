@@ -1,0 +1,823 @@
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:video_player/video_player.dart';
+
+const supabaseUrl = 'YOUR_SUPABASE_URL';
+const supabaseKey = 'YOUR_SUPABASE_ANON_KEY';
+SupabaseClient get sb => Supabase.instance.client;
+const ac = Color(0xFF3DE0D0), bg = Color(0xFF1B1030), card = Color(0xFF2A1B47);
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Supabase.initialize(url: supabaseUrl, anonKey: supabaseKey);
+  runApp(const GtApp());
+}
+
+void toast(BuildContext c, String m) =>
+    ScaffoldMessenger.of(c).showSnackBar(SnackBar(content: Text(m)));
+
+class GtApp extends StatelessWidget {
+  const GtApp({super.key});
+  @override
+  Widget build(BuildContext context) => MaterialApp(
+        title: 'GT-video',
+        debugShowCheckedModeBanner: false,
+        theme: ThemeData.dark().copyWith(
+          scaffoldBackgroundColor: bg,
+          colorScheme: const ColorScheme.dark(primary: ac),
+          inputDecorationTheme: InputDecorationTheme(
+              filled: true,
+              fillColor: card,
+              border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide.none)),
+        ),
+        builder: (c, w) => Directionality(textDirection: TextDirection.rtl, child: w!),
+        home: StreamBuilder<AuthState>(
+          stream: sb.auth.onAuthStateChange,
+          builder: (c, _) =>
+              sb.auth.currentSession == null ? const AuthPage() : const Shell(),
+        ),
+      );
+}
+
+// ---------- تسجيل الدخول ----------
+class AuthPage extends StatefulWidget {
+  const AuthPage({super.key});
+  @override
+  State<AuthPage> createState() => _AuthPageState();
+}
+
+class _AuthPageState extends State<AuthPage> {
+  final e = TextEditingController(), p = TextEditingController(), n = TextEditingController();
+  bool signup = false, busy = false;
+
+  Future<void> submit() async {
+    setState(() => busy = true);
+    try {
+      if (signup) {
+        await sb.auth.signUp(
+            email: e.text.trim(), password: p.text, data: {'username': n.text.trim()});
+        if (mounted && sb.auth.currentSession == null) {
+          toast(context, 'تحقق من بريدك لتأكيد الحساب');
+        }
+      } else {
+        await sb.auth.signInWithPassword(email: e.text.trim(), password: p.text);
+      }
+    } on AuthException catch (x) {
+      if (mounted) toast(context, x.message);
+    }
+    if (mounted) setState(() => busy = false);
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        body: SafeArea(
+          child: ListView(padding: const EdgeInsets.all(24), children: [
+            const SizedBox(height: 80),
+            const Text('GT-video',
+                style: TextStyle(fontSize: 34, fontWeight: FontWeight.w800, color: ac)),
+            const SizedBox(height: 24),
+            if (signup) ...[
+              TextField(controller: n, decoration: const InputDecoration(hintText: 'الاسم')),
+              const SizedBox(height: 10)
+            ],
+            TextField(
+                controller: e,
+                keyboardType: TextInputType.emailAddress,
+                decoration: const InputDecoration(hintText: 'البريد الإلكتروني')),
+            const SizedBox(height: 10),
+            TextField(
+                controller: p,
+                obscureText: true,
+                decoration: const InputDecoration(hintText: 'كلمة المرور')),
+            const SizedBox(height: 16),
+            FilledButton(
+                onPressed: busy ? null : submit,
+                child: Text(signup ? 'إنشاء حساب' : 'دخول')),
+            if (signup)
+              TextButton(
+                  onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const LegalPage())),
+                  child: const Text('بإنشاء حساب أنت توافق على الشروط وسياسة الخصوصية', style: TextStyle(fontSize: 12))),
+            TextButton(
+                onPressed: () => setState(() => signup = !signup),
+                child: Text(signup ? 'لدي حساب' : 'إنشاء حساب جديد')),
+          ]),
+        ),
+      );
+}
+
+// ---------- الهيكل ----------
+class Shell extends StatefulWidget {
+  const Shell({super.key});
+  @override
+  State<Shell> createState() => _ShellState();
+}
+
+class _ShellState extends State<Shell> {
+  int i = 0;
+  final feedKey = GlobalKey<_FeedState>();
+  final notifKey = GlobalKey<_NotifsState>();
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        body: IndexedStack(index: i, children: [
+          Feed(key: feedKey, visible: i == 0),
+          const SearchPage(),
+          UploadPage(onDone: () {
+            feedKey.currentState?.load();
+            setState(() => i = 0);
+          }),
+          NotificationsPage(key: notifKey),
+          const ProfilePage(),
+        ]),
+        bottomNavigationBar: NavigationBar(
+          selectedIndex: i,
+          onDestinationSelected: (v) {
+            setState(() => i = v);
+            if (v == 3) notifKey.currentState?.load();
+          },
+          destinations: const [
+            NavigationDestination(icon: Icon(Icons.home_outlined), label: 'الرئيسية'),
+            NavigationDestination(icon: Icon(Icons.search), label: 'بحث'),
+            NavigationDestination(icon: Icon(Icons.add_box_outlined), label: 'نشر'),
+            NavigationDestination(icon: Icon(Icons.notifications_none), label: 'الإشعارات'),
+            NavigationDestination(icon: Icon(Icons.person_outline), label: 'حسابي'),
+          ],
+        ),
+      );
+}
+
+// ---------- الفيديوهات ----------
+class Feed extends StatefulWidget {
+  final bool visible;
+  const Feed({super.key, required this.visible});
+  @override
+  State<Feed> createState() => _FeedState();
+}
+
+class _FeedState extends State<Feed> {
+  List<Map<String, dynamic>> items = [];
+  int page = 0;
+  bool loading = true;
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  Future<void> load() async {
+    final r = await sb
+        .from('videos')
+        .select('*, profiles(username), likes(count), comments(count)')
+        .order('created_at', ascending: false)
+        .limit(30);
+    final bl = await sb.from('blocks').select('blocked_id').eq('blocker_id', sb.auth.currentUser!.id);
+    final blocked = (bl as List).map((e) => e['blocked_id']).toSet();
+    final list = List<Map<String, dynamic>>.from(r).where((v) => !blocked.contains(v['user_id'])).toList();
+    if (mounted) setState(() { items = list; loading = false; });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (loading) return const Center(child: CircularProgressIndicator());
+    if (items.isEmpty) return const Center(child: Text('لا توجد فيديوهات بعد. انشر أول فيديو.'));
+    return PageView.builder(
+      scrollDirection: Axis.vertical,
+      itemCount: items.length,
+      onPageChanged: (v) => setState(() => page = v),
+      itemBuilder: (c, k) =>
+          VideoItem(key: ValueKey(items[k]['id']), v: items[k], active: widget.visible && k == page),
+    );
+  }
+}
+
+class VideoItem extends StatefulWidget {
+  final Map<String, dynamic> v;
+  final bool active;
+  const VideoItem({super.key, required this.v, required this.active});
+  @override
+  State<VideoItem> createState() => _VideoItemState();
+}
+
+class _VideoItemState extends State<VideoItem> {
+  late VideoPlayerController c;
+  bool ready = false, liked = false, following = false;
+  late int likes, comments;
+  String get uid => sb.auth.currentUser!.id;
+  String get owner => widget.v['user_id'];
+
+  int _count(String k) {
+    final l = widget.v[k] as List;
+    return l.isEmpty ? 0 : l[0]['count'] as int;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    likes = _count('likes');
+    comments = _count('comments');
+    c = VideoPlayerController.networkUrl(Uri.parse(widget.v['url']))
+      ..initialize().then((_) {
+        if (!mounted) return;
+        c.setLooping(true);
+        setState(() => ready = true);
+        if (widget.active) c.play();
+      });
+    _state();
+  }
+
+  Future<void> _state() async {
+    final l = await sb.from('likes').select().eq('video_id', widget.v['id']).eq('user_id', uid).maybeSingle();
+    final f = await sb.from('follows').select().eq('follower_id', uid).eq('following_id', owner).maybeSingle();
+    if (mounted) setState(() { liked = l != null; following = f != null; });
+  }
+
+  @override
+  void didUpdateWidget(VideoItem o) {
+    super.didUpdateWidget(o);
+    if (!ready) return;
+    widget.active ? c.play() : c.pause();
+  }
+
+  @override
+  void dispose() {
+    c.dispose();
+    super.dispose();
+  }
+
+  Future<void> like() async {
+    setState(() { liked = !liked; likes += liked ? 1 : -1; });
+    final id = widget.v['id'];
+    if (liked) {
+      await sb.from('likes').insert({'video_id': id, 'user_id': uid});
+    } else {
+      await sb.from('likes').delete().eq('video_id', id).eq('user_id', uid);
+    }
+  }
+
+  Future<void> follow() async {
+    setState(() => following = !following);
+    if (following) {
+      await sb.from('follows').insert({'follower_id': uid, 'following_id': owner});
+    } else {
+      await sb.from('follows').delete().eq('follower_id', uid).eq('following_id', owner);
+    }
+  }
+
+  void menu() => showModalBottomSheet(
+      context: context,
+      builder: (ctx) => SafeArea(
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              ListTile(
+                  leading: const Icon(Icons.flag_outlined),
+                  title: const Text('إبلاغ عن الفيديو'),
+                  onTap: () { Navigator.pop(ctx); report(); }),
+              if (owner != uid)
+                ListTile(
+                    leading: const Icon(Icons.block),
+                    title: const Text('حظر هذا المستخدم'),
+                    onTap: () { Navigator.pop(ctx); block(); }),
+            ]),
+          ));
+
+  void report() => showModalBottomSheet(
+      context: context,
+      builder: (ctx) => SafeArea(
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              const Padding(padding: EdgeInsets.all(12), child: Text('سبب الإبلاغ', style: TextStyle(fontWeight: FontWeight.bold))),
+              for (final r in ['محتوى جنسي', 'عنف أو إيذاء', 'تحرش أو كراهية', 'احتيال أو سبام', 'محتوى مخالف لحقوقي', 'سبب آخر'])
+                ListTile(
+                    title: Text(r),
+                    onTap: () async {
+                      Navigator.pop(ctx);
+                      await sb.from('reports').insert({'reporter_id': uid, 'video_id': widget.v['id'], 'reported_user_id': owner, 'reason': r});
+                      if (mounted) toast(context, 'تم إرسال البلاغ. شكرًا لك');
+                    }),
+            ]),
+          ));
+
+  Future<void> block() async {
+    await sb.from('blocks').insert({'blocker_id': uid, 'blocked_id': owner});
+    await sb.from('follows').delete().eq('follower_id', uid).eq('following_id', owner);
+    if (mounted) toast(context, 'تم الحظر. لن تظهر لك فيديوهاته بعد التحديث');
+  }
+
+  Widget action(IconData i, String t, VoidCallback f, {Color? color}) => Column(children: [
+        IconButton(onPressed: f, icon: Icon(i, size: 32, color: color), style: IconButton.styleFrom(backgroundColor: Colors.black38)),
+        Text(t, style: const TextStyle(fontSize: 12)),
+      ]);
+
+  @override
+  Widget build(BuildContext context) {
+    final name = widget.v['profiles']?['username'] ?? '';
+    return Stack(fit: StackFit.expand, children: [
+      GestureDetector(
+        onTap: () => setState(() => c.value.isPlaying ? c.pause() : c.play()),
+        child: ready
+            ? FittedBox(fit: BoxFit.cover, child: SizedBox(width: c.value.size.width, height: c.value.size.height, child: VideoPlayer(c)))
+            : const Center(child: CircularProgressIndicator()),
+      ),
+      const DecoratedBox(decoration: BoxDecoration(gradient: LinearGradient(begin: Alignment.center, end: Alignment.bottomCenter, colors: [Colors.transparent, Colors.black87]))),
+      Positioned(
+        right: 16, left: 90, bottom: 24,
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+          Row(children: [
+            Text('@$name', style: const TextStyle(fontWeight: FontWeight.bold)),
+            if (owner != uid) ...[
+              const SizedBox(width: 8),
+              OutlinedButton(onPressed: follow, style: OutlinedButton.styleFrom(visualDensity: VisualDensity.compact), child: Text(following ? 'تتابعه' : 'متابعة')),
+            ]
+          ]),
+          const SizedBox(height: 6),
+          Text(widget.v['caption'] ?? ''),
+        ]),
+      ),
+      Positioned(
+        left: 12, bottom: 24,
+        child: Column(children: [
+          action(Icons.more_horiz, '', menu),
+          action(Icons.favorite, '$likes', like, color: liked ? Colors.redAccent : null),
+          action(Icons.chat_bubble, '$comments', () async {
+            await showModalBottomSheet(context: context, isScrollControlled: true, builder: (_) => CommentsSheet(videoId: widget.v['id']));
+            final r = await sb.from('comments').select('id').eq('video_id', widget.v['id']);
+            if (mounted) setState(() => comments = (r as List).length);
+          }),
+        ]),
+      ),
+    ]);
+  }
+}
+
+class CommentsSheet extends StatefulWidget {
+  final String videoId;
+  const CommentsSheet({super.key, required this.videoId});
+  @override
+  State<CommentsSheet> createState() => _CommentsSheetState();
+}
+
+class _CommentsSheetState extends State<CommentsSheet> {
+  List list = [];
+  final t = TextEditingController();
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  Future<void> load() async {
+    final r = await sb.from('comments').select('body, profiles(username)').eq('video_id', widget.videoId).order('created_at');
+    if (mounted) setState(() => list = r);
+  }
+
+  Future<void> add() async {
+    final b = t.text.trim();
+    if (b.isEmpty) return;
+    t.clear();
+    await sb.from('comments').insert({'video_id': widget.videoId, 'user_id': sb.auth.currentUser!.id, 'body': b});
+    load();
+  }
+
+  @override
+  Widget build(BuildContext context) => Padding(
+        padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+        child: SizedBox(
+          height: 420,
+          child: Column(children: [
+            Expanded(
+              child: list.isEmpty
+                  ? const Center(child: Text('كن أول من يعلّق'))
+                  : ListView(children: [for (final c in list) ListTile(title: Text('@${c['profiles']?['username'] ?? ''}', style: const TextStyle(fontSize: 12, color: Colors.white60)), subtitle: Text(c['body'], style: const TextStyle(fontSize: 15)))]),
+            ),
+            Padding(
+              padding: const EdgeInsets.all(8),
+              child: Row(children: [
+                Expanded(child: TextField(controller: t, decoration: const InputDecoration(hintText: 'اكتب تعليقًا'))),
+                IconButton(onPressed: add, icon: const Icon(Icons.send)),
+              ]),
+            ),
+          ]),
+        ),
+      );
+}
+
+// ---------- الرسائل ----------
+class Inbox extends StatefulWidget {
+  const Inbox({super.key});
+  @override
+  State<Inbox> createState() => _InboxState();
+}
+
+class _InboxState extends State<Inbox> {
+  Future<List> load() => sb.from('follows').select('following_id, profiles!following_id(username)').eq('follower_id', sb.auth.currentUser!.id);
+  @override
+  Widget build(BuildContext context) => SafeArea(
+        child: FutureBuilder<List>(
+          future: load(),
+          builder: (c, s) {
+            if (!s.hasData) return const Center(child: CircularProgressIndicator());
+            if (s.data!.isEmpty) return const Center(child: Text('تابع أحدًا لتبدأ محادثة معه'));
+            return ListView(children: [
+              const Padding(padding: EdgeInsets.all(16), child: Text('الرسائل', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold))),
+              for (final f in s.data!)
+                ListTile(
+                  leading: CircleAvatar(backgroundColor: ac, child: Text('${f['profiles']['username']}'[0].toUpperCase(), style: const TextStyle(color: bg))),
+                  title: Text('@${f['profiles']['username']}'),
+                  onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ChatPage(other: f['following_id'], name: f['profiles']['username']))),
+                ),
+            ]);
+          },
+        ),
+      );
+}
+
+class ChatPage extends StatefulWidget {
+  final String other, name;
+  const ChatPage({super.key, required this.other, required this.name});
+  @override
+  State<ChatPage> createState() => _ChatPageState();
+}
+
+class _ChatPageState extends State<ChatPage> {
+  final t = TextEditingController();
+  String get me => sb.auth.currentUser!.id;
+  late final Stream<List<Map<String, dynamic>>> stream =
+      sb.from('messages').stream(primaryKey: ['id']).order('created_at', ascending: false);
+
+  Future<void> send() async {
+    final b = t.text.trim();
+    if (b.isEmpty) return;
+    t.clear();
+    await sb.from('messages').insert({'sender_id': me, 'receiver_id': widget.other, 'body': b});
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: Text('@${widget.name}')),
+        body: Column(children: [
+          Expanded(
+            child: StreamBuilder<List<Map<String, dynamic>>>(
+              stream: stream,
+              builder: (c, s) {
+                final ms = (s.data ?? []).where((m) => (m['sender_id'] == me && m['receiver_id'] == widget.other) || (m['sender_id'] == widget.other && m['receiver_id'] == me)).toList();
+                return ListView.builder(
+                  reverse: true,
+                  padding: const EdgeInsets.all(12),
+                  itemCount: ms.length,
+                  itemBuilder: (c, k) {
+                    final mine = ms[k]['sender_id'] == me;
+                    return Align(
+                      alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
+                      child: Container(
+                        margin: const EdgeInsets.symmetric(vertical: 3),
+                        padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 9),
+                        decoration: BoxDecoration(color: mine ? ac : card, borderRadius: BorderRadius.circular(14)),
+                        child: Text(ms[k]['body'], style: TextStyle(color: mine ? bg : Colors.white)),
+                      ),
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.all(8),
+              child: Row(children: [
+                Expanded(child: TextField(controller: t, decoration: const InputDecoration(hintText: 'اكتب رسالة'))),
+                IconButton(onPressed: send, icon: const Icon(Icons.send)),
+              ]),
+            ),
+          ),
+        ]),
+      );
+}
+
+// ---------- النشر ----------
+class UploadPage extends StatefulWidget {
+  final VoidCallback onDone;
+  const UploadPage({super.key, required this.onDone});
+  @override
+  State<UploadPage> createState() => _UploadPageState();
+}
+
+class _UploadPageState extends State<UploadPage> {
+  final cap = TextEditingController();
+  XFile? file;
+  bool busy = false;
+
+  Future<void> publish() async {
+    if (file == null) return toast(context, 'اختر فيديو أولًا');
+    setState(() => busy = true);
+    try {
+      final uid = sb.auth.currentUser!.id;
+      final path = '$uid/${DateTime.now().millisecondsSinceEpoch}.mp4';
+      await sb.storage.from('videos').upload(path, File(file!.path));
+      final url = sb.storage.from('videos').getPublicUrl(path);
+      await sb.from('videos').insert({'user_id': uid, 'url': url, 'caption': cap.text.trim()});
+      cap.clear();
+      file = null;
+      widget.onDone();
+    } catch (e) {
+      if (mounted) toast(context, 'فشل النشر: $e');
+    }
+    if (mounted) setState(() => busy = false);
+  }
+
+  @override
+  Widget build(BuildContext context) => SafeArea(
+        child: ListView(padding: const EdgeInsets.all(16), children: [
+          const Text('انشر فيديو جديد', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 16),
+          OutlinedButton.icon(
+              onPressed: () async {
+                final f = await ImagePicker().pickVideo(source: ImageSource.gallery);
+                if (f != null) setState(() => file = f);
+              },
+              icon: const Icon(Icons.video_library),
+              label: Text(file == null ? 'اختر فيديو' : 'تم اختيار الفيديو')),
+          const SizedBox(height: 12),
+          TextField(controller: cap, maxLines: 3, decoration: const InputDecoration(hintText: 'الوصف والهاشتاج')),
+          const SizedBox(height: 16),
+          FilledButton(onPressed: busy ? null : publish, child: Text(busy ? 'جاري الرفع...' : 'نشر الفيديو')),
+        ]),
+      );
+}
+
+// ---------- الحساب ----------
+class ProfilePage extends StatelessWidget {
+  const ProfilePage({super.key});
+  @override
+  Widget build(BuildContext context) {
+    final uid = sb.auth.currentUser!.id;
+    return SafeArea(
+      child: FutureBuilder<Map<String, dynamic>>(
+        future: sb.from('profiles').select().eq('id', uid).single(),
+        builder: (c, s) => ListView(padding: const EdgeInsets.all(24), children: [
+          const CircleAvatar(radius: 40, backgroundColor: ac, child: Icon(Icons.person, size: 40, color: bg)),
+          const SizedBox(height: 12),
+          Text('@${s.data?['username'] ?? ''}', textAlign: TextAlign.center, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+          Text(sb.auth.currentUser?.email ?? '', textAlign: TextAlign.center, style: const TextStyle(color: Colors.white60)),
+          const SizedBox(height: 24),
+          OutlinedButton(onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const LegalPage())), child: const Text('الشروط وسياسة الخصوصية')),
+          const SizedBox(height: 8),
+          OutlinedButton(onPressed: () => sb.auth.signOut(), child: const Text('تسجيل الخروج')),
+          const SizedBox(height: 8),
+          TextButton(
+              style: TextButton.styleFrom(foregroundColor: Colors.redAccent),
+              onPressed: () => deleteAccount(context),
+              child: const Text('حذف حسابي نهائيًا')),
+        ]),
+      ),
+    );
+  }
+}
+
+
+// ---------- أدوات مشتركة ----------
+Future<Set> blockedIds() async {
+  final b = await sb.from('blocks').select('blocked_id').eq('blocker_id', sb.auth.currentUser!.id);
+  return (b as List).map((e) => e['blocked_id']).toSet();
+}
+
+Future<void> deleteAccount(BuildContext context) async {
+  final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+            title: const Text('حذف الحساب'),
+            content: const Text('سيتم حذف حسابك وفيديوهاتك وتعليقاتك ورسائلك نهائيًا ولا يمكن التراجع.'),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('إلغاء')),
+              TextButton(onPressed: () => Navigator.pop(ctx, true), style: TextButton.styleFrom(foregroundColor: Colors.redAccent), child: const Text('حذف نهائيًا')),
+            ],
+          ));
+  if (ok != true) return;
+  try {
+    final uid = sb.auth.currentUser!.id;
+    final files = await sb.storage.from('videos').list(path: uid);
+    if (files.isNotEmpty) {
+      await sb.storage.from('videos').remove(files.map((f) => '$uid/${f.name}').toList());
+    }
+    await sb.rpc('delete_my_account');
+    await sb.auth.signOut();
+  } catch (e) {
+    if (context.mounted) toast(context, 'تعذر حذف الحساب: $e');
+  }
+}
+
+// ---------- الشروط (نموذج مبدئي: راجعه مع محامٍ قبل النشر) ----------
+class LegalPage extends StatelessWidget {
+  const LegalPage({super.key});
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('الشروط وسياسة الخصوصية')),
+        body: ListView(padding: const EdgeInsets.all(16), children: const [
+          Text('شروط الاستخدام', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          SizedBox(height: 8),
+          Text('• أنت مسؤول عن المحتوى الذي تنشره، ويجب أن تملك حقوقه.\n'
+              '• يُمنع المحتوى الجنسي أو العنيف أو المسيء أو المحرّض على الكراهية، ولا نتسامح مع ذلك.\n'
+              '• نراجع البلاغات خلال 24 ساعة ونحذف المحتوى المخالف ونوقف الحسابات المسيئة.\n'
+              '• يمكنك الإبلاغ عن أي فيديو أو حظر أي مستخدم في أي وقت.\n'
+              '• الحد الأدنى للعمر 13 سنة.', style: TextStyle(height: 1.8)),
+          SizedBox(height: 20),
+          Text('سياسة الخصوصية', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          SizedBox(height: 8),
+          Text('• نجمع: البريد الإلكتروني، اسم المستخدم، الفيديوهات والتعليقات والرسائل التي تنشئها.\n'
+              '• نستخدمها لتشغيل التطبيق فقط ولا نبيعها لأي طرف.\n'
+              '• تُخزَّن البيانات لدى مزوّد الخدمة السحابية (Supabase).\n'
+              '• يمكنك حذف حسابك وكل بياناتك من صفحة «حسابي».\n'
+              '• للتواصل: ضع بريد الدعم هنا.', style: TextStyle(height: 1.8)),
+        ]),
+      );
+}
+
+// ---------- البحث والهاشتاجات ----------
+class FollowBtn extends StatefulWidget {
+  final String userId;
+  const FollowBtn({super.key, required this.userId});
+  @override
+  State<FollowBtn> createState() => _FollowBtnState();
+}
+
+class _FollowBtnState extends State<FollowBtn> {
+  bool? on;
+  String get me => sb.auth.currentUser!.id;
+  @override
+  void initState() {
+    super.initState();
+    sb.from('follows').select().eq('follower_id', me).eq('following_id', widget.userId).maybeSingle().then((r) {
+      if (mounted) setState(() => on = r != null);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (on == null || widget.userId == me) return const SizedBox();
+    return OutlinedButton(
+        onPressed: () async {
+          setState(() => on = !on!);
+          if (on!) {
+            await sb.from('follows').insert({'follower_id': me, 'following_id': widget.userId});
+          } else {
+            await sb.from('follows').delete().eq('follower_id', me).eq('following_id', widget.userId);
+          }
+        },
+        child: Text(on! ? 'تتابعه' : 'متابعة'));
+  }
+}
+
+class SearchPage extends StatefulWidget {
+  const SearchPage({super.key});
+  @override
+  State<SearchPage> createState() => _SearchPageState();
+}
+
+class _SearchPageState extends State<SearchPage> {
+  final q = TextEditingController();
+  List users = [], vids = [], tags = [];
+  bool searched = false, busy = false;
+  @override
+  void initState() {
+    super.initState();
+    sb.rpc('trending_hashtags').then((r) {
+      if (mounted) setState(() => tags = r as List);
+    });
+  }
+
+  Future<void> run([String? text]) async {
+    if (text != null) q.text = text;
+    final t = q.text.trim().replaceAll(RegExp(r'[%,()]'), '');
+    if (t.isEmpty) return;
+    setState(() => busy = true);
+    final blocked = await blockedIds();
+    final u = await sb.from('profiles').select('id, username').ilike('username', '%${t.replaceAll('#', '')}%').limit(20);
+    final v = await sb.from('videos').select('*, profiles(username), likes(count), comments(count)').ilike('caption', '%$t%').order('created_at', ascending: false).limit(30);
+    if (!mounted) return;
+    setState(() {
+      users = (u as List).where((x) => !blocked.contains(x['id'])).toList();
+      vids = (v as List).where((x) => !blocked.contains(x['user_id'])).toList();
+      searched = true;
+      busy = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => SafeArea(
+        child: ListView(padding: const EdgeInsets.all(16), children: [
+          TextField(
+            controller: q,
+            textInputAction: TextInputAction.search,
+            onSubmitted: (_) => run(),
+            decoration: InputDecoration(hintText: 'ابحث عن مستخدم أو #هاشتاج', prefixIcon: const Icon(Icons.search), suffixIcon: IconButton(icon: const Icon(Icons.arrow_back), onPressed: run)),
+          ),
+          const SizedBox(height: 16),
+          if (busy) const Center(child: CircularProgressIndicator()),
+          if (!searched && !busy) ...[
+            const Text('الهاشتاجات الرائجة', style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            if (tags.isEmpty) const Text('لا توجد هاشتاجات بعد', style: TextStyle(color: Colors.white60)),
+            Wrap(spacing: 8, children: [for (final t in tags) ActionChip(label: Text('#${t['tag']}'), onPressed: () => run('#${t['tag']}'))]),
+          ],
+          if (searched && !busy) ...[
+            if (users.isNotEmpty) const Text('الحسابات', style: TextStyle(fontWeight: FontWeight.bold)),
+            for (final u in users)
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: CircleAvatar(backgroundColor: ac, child: Text('${u['username']}'[0].toUpperCase(), style: const TextStyle(color: bg))),
+                title: Text('@${u['username']}'),
+                trailing: FollowBtn(userId: u['id']),
+              ),
+            const SizedBox(height: 12),
+            if (vids.isNotEmpty) const Text('الفيديوهات', style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            GridView.count(
+              crossAxisCount: 3, shrinkWrap: true, physics: const NeverScrollableScrollPhysics(), mainAxisSpacing: 4, crossAxisSpacing: 4, childAspectRatio: .65,
+              children: [
+                for (final v in vids)
+                  InkWell(
+                    onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => Scaffold(extendBodyBehindAppBar: true, appBar: AppBar(backgroundColor: Colors.transparent, elevation: 0), body: VideoItem(v: Map<String, dynamic>.from(v), active: true)))),
+                    child: Container(
+                      padding: const EdgeInsets.all(6), alignment: Alignment.bottomRight,
+                      decoration: BoxDecoration(color: card, borderRadius: BorderRadius.circular(8)),
+                      child: Text('${v['caption']}', maxLines: 4, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12)),
+                    ),
+                  ),
+              ],
+            ),
+            if (users.isEmpty && vids.isEmpty) const Center(child: Text('لا توجد نتائج')),
+          ],
+        ]),
+      );
+}
+
+// ---------- الإشعارات ----------
+class NotificationsPage extends StatefulWidget {
+  const NotificationsPage({super.key});
+  @override
+  State<NotificationsPage> createState() => _NotifsState();
+}
+
+class _NotifsState extends State<NotificationsPage> {
+  List items = [];
+  bool loading = true;
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  Future<void> load() async {
+    final uid = sb.auth.currentUser!.id;
+    final r = await sb.from('notifications').select('id, type, read, created_at, profiles!actor_id(username)').eq('user_id', uid).order('created_at', ascending: false).limit(50);
+    if (!mounted) return;
+    setState(() { items = r; loading = false; });
+    if ((r as List).any((n) => n['read'] == false)) {
+      await sb.from('notifications').update({'read': true}).eq('user_id', uid).eq('read', false);
+    }
+  }
+
+  String text(Map n) {
+    final u = '@${n['profiles']?['username'] ?? ''}';
+    switch (n['type']) {
+      case 'like': return 'أعجب $u بفيديوك';
+      case 'comment': return 'علّق $u على فيديوك';
+      case 'follow': return 'بدأ $u بمتابعتك';
+      default: return 'رسالة جديدة من $u';
+    }
+  }
+
+  IconData icon(String t) => {'like': Icons.favorite, 'comment': Icons.chat_bubble, 'follow': Icons.person_add}[t] ?? Icons.mail;
+
+  @override
+  Widget build(BuildContext context) => SafeArea(
+        child: Column(children: [
+          ListTile(
+            title: const Text('الإشعارات', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+            trailing: IconButton(
+              icon: const Icon(Icons.chat_bubble_outline),
+              tooltip: 'الرسائل',
+              onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => Scaffold(appBar: AppBar(), body: const Inbox()))),
+            ),
+          ),
+          Expanded(
+            child: loading
+                ? const Center(child: CircularProgressIndicator())
+                : RefreshIndicator(
+                    onRefresh: load,
+                    child: items.isEmpty
+                        ? ListView(children: const [SizedBox(height: 120), Center(child: Text('لا توجد إشعارات بعد'))])
+                        : ListView(children: [
+                            for (final n in items)
+                              ListTile(
+                                tileColor: n['read'] == false ? card : null,
+                                leading: Icon(icon(n['type']), color: ac),
+                                title: Text(text(n)),
+                                subtitle: Text('${n['created_at']}'.substring(0, 16).replaceAll('T', '  '), style: const TextStyle(fontSize: 11, color: Colors.white54)),
+                              ),
+                          ]),
+                  ),
+          ),
+        ]),
+      );
+}
