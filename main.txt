@@ -167,21 +167,39 @@ class _FeedState extends State<Feed> {
     load();
   }
 
+  String? error;
   Future<void> load() async {
-    final r = await sb
-        .from('videos')
-        .select('*, profiles(username), likes(count), comments(count)')
-        .order('created_at', ascending: false)
-        .limit(30);
-    final bl = await sb.from('blocks').select('blocked_id').eq('blocker_id', sb.auth.currentUser!.id);
-    final blocked = (bl as List).map((e) => e['blocked_id']).toSet();
-    final list = List<Map<String, dynamic>>.from(r).where((v) => !blocked.contains(v['user_id'])).toList();
-    if (mounted) setState(() { items = list; loading = false; });
+    if (mounted) setState(() { loading = true; error = null; });
+    try {
+      const t = Duration(seconds: 20);
+      final r = await sb
+          .from('videos')
+          .select('*, profiles(username), likes(count), comments(count)')
+          .order('created_at', ascending: false)
+          .limit(30)
+          .timeout(t);
+      final bl = await sb.from('blocks').select('blocked_id').eq('blocker_id', sb.auth.currentUser!.id).timeout(t);
+      final blocked = (bl as List).map((e) => e['blocked_id']).toSet();
+      final list = List<Map<String, dynamic>>.from(r).where((v) => !blocked.contains(v['user_id'])).toList();
+      if (mounted) setState(() { items = list; loading = false; });
+    } catch (e) {
+      if (mounted) setState(() { error = '$e'; loading = false; });
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     if (loading) return const Center(child: CircularProgressIndicator());
+    if (error != null) {
+      return Center(
+          child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                Text('تعذر تحميل الفيديوهات\n$error', textAlign: TextAlign.center),
+                const SizedBox(height: 12),
+                FilledButton(onPressed: load, child: const Text('إعادة المحاولة')),
+              ])));
+    }
     if (items.isEmpty) return const Center(child: Text('لا توجد فيديوهات بعد. انشر أول فيديو.'));
     return PageView.builder(
       scrollDirection: Axis.vertical,
@@ -204,6 +222,7 @@ class VideoItem extends StatefulWidget {
 class _VideoItemState extends State<VideoItem> {
   late VideoPlayerController c;
   bool ready = false, liked = false, following = false;
+  String? err;
   late int likes, comments;
   String get uid => sb.auth.currentUser!.id;
   String get owner => widget.v['user_id'];
@@ -224,6 +243,8 @@ class _VideoItemState extends State<VideoItem> {
         c.setLooping(true);
         setState(() => ready = true);
         if (widget.active) c.play();
+      }).catchError((e) {
+        if (mounted) setState(() => err = '$e');
       });
     _state();
   }
@@ -317,7 +338,9 @@ class _VideoItemState extends State<VideoItem> {
         onTap: () => setState(() => c.value.isPlaying ? c.pause() : c.play()),
         child: ready
             ? FittedBox(fit: BoxFit.cover, child: SizedBox(width: c.value.size.width, height: c.value.size.height, child: VideoPlayer(c)))
-            : const Center(child: CircularProgressIndicator()),
+            : err != null
+                ? Center(child: Padding(padding: const EdgeInsets.all(24), child: Text('تعذر تشغيل الفيديو\n$err', textAlign: TextAlign.center)))
+                : const Center(child: CircularProgressIndicator()),
       ),
       const DecoratedBox(decoration: BoxDecoration(gradient: LinearGradient(begin: Alignment.center, end: Alignment.bottomCenter, colors: [Colors.transparent, Colors.black87]))),
       Positioned(
